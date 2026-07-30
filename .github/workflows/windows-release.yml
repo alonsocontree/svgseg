@@ -1,0 +1,152 @@
+name: Windows executable
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # Needed to create the release and attach files to it.
+
+env:
+  # Python 3.12 rather than the newest: every wheel this build needs (numpy,
+  # scipy, scikit-image, OpenCV, PySide6) has existed for it for a long time, and
+  # a release build is the wrong place to discover a missing wheel.
+  PYTHON_VERSION: "3.12"
+
+  POTRACE_VERSION: "1.16"
+  # Pinned so a moved or tampered upstream file cannot silently change what gets
+  # shipped inside the executable. Recompute with:
+  #   sha256sum potrace-1.16.win64.zip potrace-1.16.tar.gz
+  POTRACE_WIN64_SHA256: "63699f9885b5ed053977fd94452a7bdbb77ee62b77bf28a3f17b2f14b9b9c65d"
+  POTRACE_SOURCE_SHA256: "be8248a17dedd6ccbaab2fcc45835bb0502d062e40fbded3bc56028ce5eb7acc"
+
+jobs:
+  build:
+    name: Build svgseg.exe
+    runs-on: windows-latest # Windows Server, but the binary it produces runs on Windows 10 and 11.
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Download potrace, binary and source
+        run: |
+          $base = "https://potrace.sourceforge.net/download/$env:POTRACE_VERSION"
+          New-Item -ItemType Directory -Force -Path third-party | Out-Null
+
+          function Fetch($name, $expected) {
+            $target = "third-party/$name"
+            Invoke-WebRequest -Uri "$base/$name" -OutFile $target
+            $actual = (Get-FileHash $target -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $expected) {
+              throw "$name checksum mismatch`n  expected $expected`n  got      $actual"
+            }
+            Write-Host "$name OK ($actual)"
+          }
+
+          Fetch "potrace-$env:POTRACE_VERSION.win64.zip" $env:POTRACE_WIN64_SHA256
+          # The corresponding source, shipped with the release because the GPL
+          # requires a redistributor of a binary to provide it.
+          Fetch "potrace-$env:POTRACE_VERSION.tar.gz" $env:POTRACE_SOURCE_SHA256
+
+      - name: Extract potrace
+        run: |
+          Expand-Archive "third-party/potrace-$env:POTRACE_VERSION.win64.zip" -DestinationPath third-party/win64
+          $dir = (Get-ChildItem third-party/win64 -Directory | Select-Object -First 1).FullName
+          "SVGSEG_POTRACE_EXE=$dir/potrace.exe" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "POTRACE_DIST_DIR=$dir" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          & "$dir/potrace.exe" --version
+
+      - name: Install svgseg and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[gui]" "pyinstaller>=6.10"
+
+      - name: Recompile the translation catalogues
+        # The .qm files are committed so a pip install works, but a release must
+        # not ship a catalogue that has drifted from its .ts source.
+        run: |
+          Get-ChildItem svgseg/gui/translations/*.ts | ForEach-Object {
+            pyside6-lrelease $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "lrelease failed on $($_.Name)" }
+          }
+
+      - name: Freeze
+        run: pyinstaller --noconfirm --clean packaging/windows/svgseg.spec
+
+      - name: Self test the frozen executable
+        # The build succeeding proves nothing: the failures that matter here are
+        # a library not surviving the freeze or potrace.exe not landing where the
+        # resolver looks, and both only show up at run time. The executable has no
+        # console, so its exit code is the whole signal.
+        run: |
+          ./dist/svgseg.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "the frozen executable failed its self test" }
+          $size = [math]::Round((Get-Item ./dist/svgseg.exe).Length / 1MB, 1)
+          Write-Host "svgseg.exe is $size MB"
+
+      - name: Assemble the release folder
+        run: |
+          $version = if ($env:GITHUB_REF -like "refs/tags/*") {
+            $env:GITHUB_REF -replace "refs/tags/v?", ""
+          } else {
+            "dev-$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          "VERSION=$version" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $out = "svgseg-$version-win64"
+          New-Item -ItemType Directory -Force -Path "$out/potrace" | Out-Null
+          Copy-Item ./dist/svgseg.exe "$out/svgseg.exe"
+          Copy-Item LICENSE "$out/LICENSE.txt"
+          Copy-Item README.md "$out/README.md"
+          Copy-Item packaging/windows/THIRD-PARTY.md "$out/THIRD-PARTY.md"
+          # potrace's own licence and credits, alongside its source tarball.
+          foreach ($file in "COPYING", "AUTHORS", "README", "NEWS") {
+            Copy-Item "$env:POTRACE_DIST_DIR/$file" "$out/potrace/$file.txt"
+          }
+          Copy-Item "third-party/potrace-$env:POTRACE_VERSION.tar.gz" "$out/potrace/"
+
+          Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
+          "BUNDLE=$out" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          Get-ChildItem $out -Recurse | Select-Object FullName, Length
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}
+          path: ${{ env.BUNDLE }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The bare executable as well as the zip: the zip is the licence-complete
+          # download, but most people just want the .exe, and the potrace source
+          # sits next to it on the same release page either way.
+          $exe = "${{ env.BUNDLE }}.exe"
+          Copy-Item ./dist/svgseg.exe $exe
+
+          # The notes live in a reviewable file. Substituting here rather than
+          # building the markdown inline avoids PowerShell eating the backticks.
+          (Get-Content packaging/windows/RELEASE-NOTES.md -Raw).
+            Replace('@EXE@', $exe).
+            Replace('@POTRACE_VERSION@', $env:POTRACE_VERSION) |
+            Set-Content notes.md -Encoding utf8
+
+          gh release create "${{ github.ref_name }}" `
+            "$exe" `
+            "${{ env.BUNDLE }}.zip" `
+            "third-party/potrace-${env:POTRACE_VERSION}.tar.gz" `
+            --title "svgseg ${{ env.VERSION }}" `
+            --notes-file notes.md

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch makes the previous run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so a compromised or moved upstream file cannot silently change the
+  # binary. Bump both this and POTRACE_VERSION together.
+  POTRACE_VERSION: "1.16"
+  POTRACE_WIN64_SHA256: "63699f9885b5ed053977fd94452a7bdbb77ee62b77bf28a3f17b2f14b9b9c65d"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip ruff
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    # The whole point of the matrix: the pipeline shells out to potrace and
+    # builds paths by hand, so a path-separator or line-ending assumption that
+    # only bites on Windows has to fail here rather than in someone's install.
+    name: Test ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install potrace (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y potrace
+
+      - name: Install potrace (macOS)
+        if: runner.os == 'macOS'
+        run: brew install potrace
+
+      - name: Install potrace (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = "potrace.zip"
+          $url = "https://potrace.sourceforge.net/download/$env:POTRACE_VERSION/potrace-$env:POTRACE_VERSION.win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:POTRACE_WIN64_SHA256) {
+            throw "potrace checksum mismatch: got $actual"
+          }
+          Expand-Archive $zip -DestinationPath potrace-dist
+          $dir = (Get-ChildItem potrace-dist -Directory | Select-Object -First 1).FullName
+          # On the PATH, which is the same way a Windows user would install it, so
+          # the tests exercise the ordinary resolution path.
+          "$dir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: potrace is reachable
+        run: potrace --version
+
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: The CLI works end to end on a real image
+        run: |
+          svgseg examples/flat_logo.png -o flat.svg
+          python packaging/check_svg.py flat.svg --min-paths 5
+
+  gui:
+    # Run on Windows because that is where the release binary goes, and because
+    # PySide6 needs no extra system libraries there. The window is never shown:
+    # the offscreen platform plugin is enough to prove it constructs.
+    name: GUI smoke test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[gui,dev]"
+      - name: The window constructs and both languages load
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python packaging/gui_smoke_test.py
