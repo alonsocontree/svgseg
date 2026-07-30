@@ -83,14 +83,37 @@ jobs:
         run: pyinstaller --noconfirm --clean packaging/windows/svgseg.spec
 
       - name: Self test the frozen executable
-        # The build succeeding proves nothing: the failures that matter here are
-        # a library not surviving the freeze or potrace.exe not landing where the
-        # resolver looks, and both only show up at run time. The executable has no
-        # console, so its exit code is the whole signal.
+        # The build succeeding proves nothing: a library not surviving the freeze,
+        # or potrace.exe not landing where the resolver looks, only shows up at
+        # run time.
+        #
+        # Start-Process -Wait, not a bare call. PowerShell does not wait for a
+        # windowed executable, so a bare call returns immediately and leaves
+        # $LASTEXITCODE unset -- which then compares unequal to 0 and reports a
+        # failure that never happened. That is exactly what the first version of
+        # this step did.
+        #
+        # The report comes from the log file because a windowed process has no
+        # stdout to read.
         run: |
-          ./dist/svgseg.exe --selftest
-          if ($LASTEXITCODE -ne 0) { throw "the frozen executable failed its self test" }
-          $size = [math]::Round((Get-Item ./dist/svgseg.exe).Length / 1MB, 1)
+          $log = "svgseg-selftest.log"
+          Remove-Item $log -ErrorAction SilentlyContinue
+          # -WorkingDirectory explicitly: Start-Process inherits the .NET current
+          # directory, which is not always PowerShell's, and the log would then
+          # be written somewhere this step never looks.
+          $run = Start-Process -FilePath "dist\svgseg.exe" -ArgumentList "--selftest" `
+                               -WorkingDirectory $PWD -Wait -PassThru
+          if (Test-Path $log) {
+            Write-Host "--- $log ---"
+            Get-Content $log | Write-Host
+            Write-Host "--- end ---"
+          } else {
+            Write-Host "the executable wrote no log at all"
+          }
+          if ($run.ExitCode -ne 0) {
+            throw "self test failed with exit code $($run.ExitCode)"
+          }
+          $size = [math]::Round((Get-Item dist\svgseg.exe).Length / 1MB, 1)
           Write-Host "svgseg.exe is $size MB"
 
       - name: Assemble the release folder

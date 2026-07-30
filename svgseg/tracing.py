@@ -77,6 +77,14 @@ class Shape:
     transform: str
 
 
+# On Windows every subprocess started from a windowed program flashes up a
+# console. One region is one potrace call, and a real logo has thousands, so
+# without this the GUI would strobe the screen with black rectangles for the
+# whole conversion. The flag does not exist on other platforms, where 0 means
+# "no special creation flags".
+_NO_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _pbm(mask: np.ndarray) -> bytes:
     """Binary PBM (P4). In PBM a set bit is black, which is what potrace traces."""
     height, width = mask.shape
@@ -109,6 +117,7 @@ def _run_potrace(
         input=_pbm(mask),
         capture_output=True,
         check=True,
+        creationflags=_NO_CONSOLE,
     )
     output = process.stdout.decode("utf-8", "replace")
     transform = _RE_TRANSFORM.search(output)

@@ -103,10 +103,13 @@ exe = EXE(  # noqa: F821
     upx_exclude=[],
     runtime_tmpdir=None,
     # A GUI app: a console window flashing up would be a bug. It also means the
-    # process has no stdout, which is why --selftest reports through its exit
-    # code.
+    # process has no stdout, which is why --selftest reports through a log file
+    # and an exit code.
     console=False,
-    disable_windowed_traceback=False,
+    # A crash must not open a modal dialog: nobody is there to dismiss it on a CI
+    # runner, and the job would sit there until its six-hour timeout instead of
+    # failing. svgseg_gui.py catches and writes down the traceback instead.
+    disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
